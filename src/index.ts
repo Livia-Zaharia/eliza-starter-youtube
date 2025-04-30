@@ -64,14 +64,19 @@ export function parseArguments(): {
   }
 }
 
+
 export async function loadCharacters(
   charactersArg: string
 ): Promise<Character[]> {
   let characterPaths = charactersArg?.split(",").map((filePath) => {
     if (path.basename(filePath) === filePath) {
-      filePath = "../characters/" + filePath;
+      // If it's just a filename, resolve it relative to the characters directory
+      filePath = path.resolve(process.cwd(), "characters", filePath);
+    } else {
+      // If it's a full path, ensure it's properly resolved
+      filePath = path.resolve(filePath);
     }
-    return path.resolve(process.cwd(), filePath.trim());
+    return filePath;
   });
 
   const loadedCharacters = [];
@@ -79,6 +84,7 @@ export async function loadCharacters(
   if (characterPaths?.length > 0) {
     for (const path of characterPaths) {
       try {
+        console.log("Loading character from:", path);
         const character = JSON.parse(fs.readFileSync(path, "utf8"));
 
         validateCharacterConfig(character);
@@ -133,7 +139,7 @@ export function getTokenForProvider(
       );
     case ModelProviderName.OPENROUTER:
       return (
-        character.settings?.secrets?.OPENROUTER || settings.OPENROUTER_API_KEY
+        character.settings?.secrets?.OPENROUTER_API_KEY || settings.OPENROUTER_API_KEY
       );
     case ModelProviderName.GROK:
       return character.settings?.secrets?.GROK_API_KEY || settings.GROK_API_KEY;
@@ -168,30 +174,41 @@ export async function initializeClients(
   const clients = [];
   const clientTypes = character.clients?.map((str) => str.toLowerCase()) || [];
 
-  if (clientTypes.includes("auto")) {
-    const autoClient = await AutoClientInterface.start(runtime);
-    if (autoClient) clients.push(autoClient);
-  }
-
-  if (clientTypes.includes("discord")) {
-    clients.push(await DiscordClientInterface.start(runtime));
-  }
-
-  if (clientTypes.includes("telegram")) {
-    const telegramClient = await TelegramClientInterface.start(runtime);
-    if (telegramClient) clients.push(telegramClient);
-  }
-
-  if (clientTypes.includes("twitter")) {
-    const twitterClients = await TwitterClientInterface.start(runtime);
-    clients.push(twitterClients);
+  for (const clientType of clientTypes) {
+    try {
+      let client;
+      switch (clientType) {
+        case "auto":
+          client = await AutoClientInterface.start(runtime);
+          break;
+        case "discord":
+          client = await DiscordClientInterface.start(runtime);
+          break;
+        case "telegram":
+          client = await TelegramClientInterface.start(runtime);
+          break;
+        case "twitter":
+          client = await TwitterClientInterface.start(runtime);
+          break;
+      }
+      if (client) clients.push(client);
+    } catch (error) {
+      elizaLogger.warn(`Failed to initialize ${clientType} client:`, error);
+      // Continue with other clients even if one fails
+    }
   }
 
   if (character.plugins?.length > 0) {
     for (const plugin of character.plugins) {
       if (plugin.clients) {
         for (const client of plugin.clients) {
-          clients.push(await client.start(runtime));
+          try {
+            const initializedClient = await client.start(runtime);
+            if (initializedClient) clients.push(initializedClient);
+          } catch (error) {
+            elizaLogger.warn(`Failed to initialize plugin client:`, error);
+            // Continue with other clients even if one fails
+          }
         }
       }
     }
@@ -255,16 +272,18 @@ async function startAgent(character: Character, directClient: DirectClient) {
     }
 
     const db = initializeDatabase(dataDir);
-
     await db.init();
 
     const cache = intializeDbCache(character, db);
     const runtime = createAgent(character, db, cache, token);
 
-    await runtime.initialize();
+    try {
+      await runtime.initialize();
+    } catch (error) {
+      elizaLogger.warn("Some services failed to initialize, continuing with available services:", error);
+    }
 
     const clients = await initializeClients(character, runtime);
-
     directClient.registerAgent(runtime);
 
     return clients;
@@ -285,14 +304,17 @@ const startAgents = async () => {
   let charactersArg = args.characters || args.character;
 
   let characters = [character];
-  console.log("charactersArg", charactersArg);
+  console.log("Initial characters:", characters);
   if (charactersArg) {
+    console.log("Loading characters from:", charactersArg);
     characters = await loadCharacters(charactersArg);
   }
-  console.log("characters", characters);
+  console.log("Loaded characters:", characters);
   try {
     for (const character of characters) {
-      await startAgent(character, directClient as DirectClient);
+      console.log("Starting agent for character:", character.name);
+      const clients = await startAgent(character, directClient as DirectClient);
+      console.log("Agent started with clients:", clients);
     }
   } catch (error) {
     elizaLogger.error("Error starting agents:", error);
@@ -300,6 +322,7 @@ const startAgents = async () => {
 
   function chat() {
     const agentId = characters[0].name ?? "Agent";
+    console.log("Starting chat with agent:", agentId);
     rl.question("You: ", async (input) => {
       await handleUserInput(input, agentId);
       if (input.toLowerCase() !== "exit") {
@@ -336,6 +359,7 @@ async function handleUserInput(input, agentId) {
 
   try {
     const serverPort = parseInt(settings.SERVER_PORT || "3000");
+    console.log(`Sending message to agent ${agentId} at port ${serverPort}`);
 
     const response = await fetch(
       `http://localhost:${serverPort}/${agentId}/message`,
@@ -350,9 +374,20 @@ async function handleUserInput(input, agentId) {
       }
     );
 
-    const data = await response.json();
-    data.forEach((message) => console.log(`${"Agent"}: ${message.text}`));
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`Server error (${response.status}): ${errorText}`);
+      return;
+    }
+
+    try {
+      const data = await response.json();
+      data.forEach((message) => console.log(`${"Agent"}: ${message.text}`));
+    } catch (e) {
+      const text = await response.text();
+      console.error(`Failed to parse response as JSON: ${text}`);
+    }
   } catch (error) {
-    console.error("Error fetching response:", error);
+    console.error("Error communicating with agent:", error);
   }
 }
